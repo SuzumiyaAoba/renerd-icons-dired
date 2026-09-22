@@ -30,7 +30,7 @@
     (point)))
 
 (defun renerd-benchmark--measure-renerd (directory files)
-  (let (buffer enable refresh overlays queue)
+  (let (buffer enable refresh scroll overlays prefetched)
     (unwind-protect
         (save-window-excursion
           (let ((dired-mode-hook nil))
@@ -46,20 +46,56 @@
                                (lambda (&rest _) visible-end)))
                       (renerd-icons-dired-mode 1))))
             (setq overlays (renerd-benchmark--overlay-count
-                            'renerd-icons-dired-overlay)
-                  queue (length renerd-icons-dired--queue))
+                            'renerd-icons-dired-overlay))
+            ;; Let the idle look-ahead finish, then measure it.
+            (garbage-collect)
+            (setq prefetched
+                  (benchmark-run 1
+                    (while renerd-icons-dired--timer
+                      (renerd-icons-dired--idle
+                       buffer renerd-icons-dired--generation))))
+            (setq prefetched
+              (cons (car prefetched)
+                    (renerd-benchmark--overlay-count
+                     'renerd-icons-dired-overlay)))
             (garbage-collect)
             (setq refresh
                   (benchmark-run 10
                     (cl-letf (((symbol-function 'window-end)
                                (lambda (&rest _) visible-end)))
                       (renerd-icons-dired-refresh))))
+            ;; Scroll 50 windows of 40 lines over un-annotated content.
+            (let ((starts nil))
+              (save-excursion
+                (goto-char (point-max))
+                (while (> (point) (point-min))
+                  (push (point) starts)
+                  (forward-line -40)))
+              (renerd-icons-dired--remove-overlays t)
+              (setq renerd-icons-dired--coverage nil)
+              (cl-incf renerd-icons-dired--generation)
+              (garbage-collect)
+              (setq scroll
+                    (benchmark-run 1
+                      (dolist (st starts)
+                        (cl-letf (((symbol-function 'window-start)
+                                   (lambda (&rest _) st))
+                                  ((symbol-function 'window-end)
+                                   (lambda (&rest _)
+                                     (save-excursion
+                                       (goto-char st)
+                                       (forward-line 40)
+                                       (point)))))
+                          (renerd-icons-dired--update-window
+                           (selected-window)))))))
             `((backend . "renerd-icons-dired")
               (files . ,files)
               (enable_seconds . ,(car enable))
               (refresh10_seconds . ,(car refresh))
+              (scroll_seconds . ,(car scroll))
               (overlays_after_enable . ,overlays)
-              (queued_after_enable . ,queue))))
+              (overlays_after_idle . ,(cdr prefetched))
+              (idle_seconds . ,(car prefetched)))))
       (when (buffer-live-p buffer) (kill-buffer buffer)))))
 
 (defun renerd-benchmark--measure-old (directory files)

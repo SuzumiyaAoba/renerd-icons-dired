@@ -48,10 +48,22 @@ The hot path is bounded by displayed lines, not directory size:
    away.
 2. A configurable look-ahead area is queued with `renerd-icons-dired-prefetch-lines`.
 3. Queued work runs in idle chunks of at most `renerd-icons-dired-chunk-size`.
-4. Existing overlays are reused; ordinary refreshes do not delete all overlays.
-5. Icon strings are cached.  Directory icons are cached by absolute path because
-   Nerd Icons may check `.git`, symlink and remote status.  File icons are cached
-   by the provided Dired file name and icon function.
+4. Filename positions come from the `dired-filename` text property instead of
+   `dired-get-filename`, and directory detection reads the ls type column
+   instead of calling `file-directory-p` (symlinks still fall back to it).
+5. A buffer-wide coverage record `(generation tick start end)` makes repeated
+   window updates and small scrolls free; only the uncovered fringe of a range
+   is ever scanned.
+6. Buffer edits drop affected overlays through `after-change-functions`, so
+   renames do not leave stale icons.
+7. Icon strings are cached.  Directory icons are cached by absolute path because
+   Nerd Icons may check `.git`, symlink and remote status.  File icons are
+   cached by the provided Dired file name and icon function.
+8. With the default `nerd-icons-icon-for-file`, names that cannot match
+   `nerd-icons-regexp-icon-alist` (checked via two combined regexps) resolve
+   through a per-extension cache instead of calling the icon function for
+   every name.  Set `renerd-icons-dired-fast-file-icons` to nil to always call
+   the configured function; results are identical either way.
 
 Tradeoffs:
 
@@ -84,18 +96,22 @@ simulates a 40-line visible window and measures visible + look-ahead work; for
 `nerd-icons-dired`, enable/refresh annotate the whole buffer.  This compares the
 intended update strategies, not identical eager-all-entries behavior.
 
-Initial local run on macOS / Emacs 31.1 after warming Nerd Icons data:
+Local run on macOS / Emacs 31.1 (unique file names):
 
-| Files | Backend | Enable | 10 refreshes | Overlays after enable |
-| ---: | --- | ---: | ---: | ---: |
-| 1,000 | renerd-icons-dired | 99 ms | 6 ms | 39 visible + 80 queued |
-| 1,000 | nerd-icons-dired | 54 ms | 116 ms | 1,002 |
-| 10,000 | renerd-icons-dired | <1 ms | 6 ms | 39 visible + 80 queued |
-| 10,000 | nerd-icons-dired | 466 ms | 5,116 ms | 10,002 |
+| Files | Backend | Enable | 10 refreshes | Sweep (all lines, warm icon cache) | Idle annotate all (cold icon cache) |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 1,000 | renerd-icons-dired | 92 ms | 0.12 ms | 6 ms | 6 ms |
+| 1,000 | nerd-icons-dired | 43 ms | 116 ms | — | — |
+| 10,000 | renerd-icons-dired | 0.13 ms | 0.14 ms | 30 ms | 162 ms |
+| 10,000 | nerd-icons-dired | 440 ms | 4,974 ms | — | — |
+
+"Sweep" applies one window update per disjoint 40-line window across the whole
+buffer after the icon cache is warm (~0.12 ms per window); "idle annotate all"
+covers the first full-buffer annotation including per-name icon resolution.
 
 The first renerd run still includes one-time Dired/Nerd Icons/cache setup not
-fully isolated by this simple benchmark.  Use repeated, interleaved fresh-process
-runs before claiming a stable speedup factor.
+fully isolated by this simple benchmark.  Use repeated, interleaved
+fresh-process runs before claiming a stable speedup factor.
 
 ## License
 

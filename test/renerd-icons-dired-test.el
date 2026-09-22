@@ -37,12 +37,13 @@
                     (overlays-in (point-min) (point-max))))
 
 (defun renerd-test--drain ()
-  (let ((limit 1000))
-    (while (and renerd-icons-dired--queue (> limit 0))
+  "Run the idle worker until no look-ahead work remains."
+  (let ((limit 100))
+    (while (and renerd-icons-dired--timer (> limit 0))
       (setq limit (1- limit))
-      (renerd-icons-dired--process-queue (current-buffer)
-                                         renerd-icons-dired--generation))
-    (should-not renerd-icons-dired--queue)))
+      (renerd-icons-dired--idle (current-buffer)
+                                renerd-icons-dired--generation))
+    (should-not renerd-icons-dired--timer)))
 
 (ert-deftest renerd-icons-dired-visible-first-and-queue ()
   (renerd-test--dired (cl-loop for i below 500 collect (format "file-%04d.el" i))
@@ -55,14 +56,16 @@
       (let ((visible-end (point)))
         (goto-char (point-min))
         (cl-letf (((symbol-function 'window-end) (lambda (&rest _) visible-end)))
-          (renerd-icons-dired-mode 1)))
-      (let ((initial (length (renerd-test--overlays))))
-        (should (> initial 0))
-        (should (< initial 500))
-        (should renerd-icons-dired--queue)
-        (renerd-test--drain)
-        ;; Only visible + prefetch region should have been queued, not all 500.
-        (should (< (length (renerd-test--overlays)) 500))))))
+          (renerd-icons-dired-mode 1)
+          (let ((initial (length (renerd-test--overlays))))
+            (should (> initial 0))
+            (should (< initial 500))
+            ;; Look-ahead work remains scheduled.
+            (should renerd-icons-dired--timer)
+            (renerd-test--drain)
+            ;; Only visible + prefetch region should have been annotated,
+            ;; not all 500.
+            (should (< (length (renerd-test--overlays)) 500))))))))
 
 (ert-deftest renerd-icons-dired-refresh-reuses-overlays ()
   (renerd-test--dired '("a.el" "b.el" "dir/")
@@ -118,7 +121,8 @@
     (should (memq #'renerd-icons-dired--post-command post-command-hook))
     (renerd-icons-dired-mode -1)
     (should-not (renerd-test--overlays))
-    (should-not renerd-icons-dired--queue)
+    (should-not renerd-icons-dired--timer)
+    (should-not renerd-icons-dired--coverage)
     (should-not (memq #'renerd-icons-dired--post-command post-command-hook))))
 
 (ert-deftest renerd-icons-dired-no-whole-buffer-work-on-enable ()
@@ -131,10 +135,51 @@
         (goto-char (point-min))
         (cl-letf (((symbol-function 'window-end) (lambda (&rest _) visible-end)))
           (renerd-icons-dired-mode 1)))
-      (let ((seen (+ (length (renerd-test--overlays))
-                     (length renerd-icons-dired--queue))))
-        ;; Batch window is 24-ish lines; with 20-line prefetch this must stay
-        ;; far below the directory size.
+      (let ((seen (length (renerd-test--overlays))))
+        ;; Batch window is 24-ish lines; only the visible slice is annotated
+        ;; synchronously, so this must stay far below the directory size.
         (should (< seen 200))))))
+
+(ert-deftest renerd-icons-dired-edit-invalidates-icon ()
+  (renerd-test--dired '("a.el" "b.el")
+    (let ((renerd-icons-dired-file-icon-function (lambda (&rest _) "F"))
+          (renerd-icons-dired-dir-icon-function (lambda (&rest _) "D")))
+      (renerd-icons-dired-mode 1)
+      (renerd-test--drain)
+      (let ((before (length (renerd-test--overlays))))
+        ;; Editing a line drops its overlay; the next update re-annotates it.
+        (goto-char (point-min))
+        (forward-line 3)
+        (let ((inhibit-read-only t))
+          (insert " ")
+          (delete-char -1))
+        (renerd-icons-dired--update-windows)
+        (renerd-test--drain)
+        (should (= before (length (renerd-test--overlays))))))))
+
+(ert-deftest renerd-icons-dired-symlink-uses-target-type ()
+  (renerd-test--dired '("real-dir/" "a.el")
+    (make-symbolic-link "real-dir"
+                        (expand-file-name "dir-link" default-directory) t)
+    (revert-buffer)
+    (let ((renerd-icons-dired-file-icon-function (lambda (&rest _) "F"))
+          (renerd-icons-dired-dir-icon-function (lambda (&rest _) "D"))
+          (renerd-icons-dired-infix-string "|"))
+      (renerd-icons-dired-mode 1)
+      (renerd-test--drain)
+      ;; A symlink to a directory resolves through file-directory-p and must
+      ;; get the directory icon.
+      (goto-char (point-min))
+      (let ((prefix nil))
+        (while (< (point) (point-max))
+          (when (equal (and (dired-move-to-filename nil)
+                            (dired-get-filename 'relative 'noerror))
+                       "dir-link")
+            (dolist (overlay (overlays-in (1- (point)) (point)))
+              (when (overlay-get overlay 'renerd-icons-dired-overlay)
+                (setq prefix (substring-no-properties
+                              (overlay-get overlay 'after-string))))))
+          (forward-line 1))
+        (should (equal prefix "D|"))))))
 
 ;;; renerd-icons-dired-test.el ends here
