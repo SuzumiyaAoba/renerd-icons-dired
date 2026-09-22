@@ -178,6 +178,76 @@
         (renerd-test--drain)
         (should (= before (length (renerd-test--overlays))))))))
 
+(ert-deftest renerd-icons-dired-fast-path-matches-real-function ()
+  ;; The dispatch tables must produce exactly the same icons as plain
+  ;; `nerd-icons-icon-for-file': special names delegate to it, ordinary
+  ;; names take the extension cache.  The corpus exercises every bucket
+  ;; class: literal prefixes, literal suffixes, the anchored fallback
+  ;; regexp (group/optional prefixes), and plain names.
+  (let ((names '("file.el" "TAGS" "TODO" "LICENSE" "LICENSE.txt" "readme"
+                 "readme.md" "README" "COPYING" "NEWS" "ChangeLog" "INSTALL"
+                 "Makefile.am" "Makefile.in" "Makefile" "GNUmakefile"
+                 "configure" "configure.ac" "config.guess" "code-of-conduct"
+                 "MAINTAINERS" "CONTRIBUTE" "BUGS" "ar-lib" "depmond"
+                 "install-sh" "missing" "mkdep" "mkinstalldirs"
+                 "move-if-change" "symlink-tree" "test-driver" "ylwrap"
+                 ".editorconfig" ".env" ".env.local" ".env.dev.local"
+                 ".envrc" ".envx" ".environment"
+                 "nginx" "xnginx" "nginx.conf" "apache" "myapache"
+                 "backup~" "~" "x~"
+                 "test.rb" "_test.rb" "xtest.rb" "test_helper.rb"
+                 "xtest_helper.rb" "spec.rb" "_spec.rb" "spec_helper.rb"
+                 "spec.ts" "-spec.ts" "xspec.ts" "test.ts" "-test.ts"
+                 "spec.js" "-spec.js" "test.js" "-test.js"
+                 "spec.jsx" "-spec.jsx" "test.jsx" "-test.jsx"
+                 ".npmignore" "x.npmignore" "npmignore"
+                 "Jenkinsfile" "xJenkinsfile" "Cask" "xCask" "Eask" "xEask"
+                 "babel.config.js" "xbabel.config.js"
+                 "CMakeLists.txt" "CMakeCache.txt" "meson.build"
+                 "meson_options.txt" "stack.yaml.json" "serverless.yml"
+                 "mix.lock" "Gemfile" "Gemfile.lock" "xGemfile.lock"
+                 "Podfile" "Dangerfile" "Appfile" "Matchfile"
+                 ".dockerignore" "Dockerfile" "Containerfile" ".Dockerfile"
+                 "xDockerfile" "docker-compose.yml" "compose.yml"
+                 "compose.yaml" "docker-compose.gitlab.yml"
+                 "Brewfile" "PKGBUILD" ".SRCINFO" "go.mod" "go.work"
+                 "xgo.mod" "Cargo.toml" "Cargo.lock" "flake.lock"
+                 "MERGE_HEAD" "COMMIT_EDITMSG" ".gitlab-ci.yml"
+                 ".gitlab-ci.yaml" "stylelint" "stylelint.config.js"
+                 "package.json" "package.lock.json" "yarn.lock"
+                 "bower.json" "gulpfile" "gulpfile.js" "gruntfile"
+                 "webpack" "webpack.config.js"
+                 ".eslint" "eslint" "eslint.config.js" ".eslintrc" "xeslint"
+                 ".prettier" "prettier" ".prettierrc" ".jest" "jest"
+                 "jest.config.js" "vite.config" "vite.config.ts" "vitest"
+                 "bookmark" "bookmarks" "xbookmark"
+                 "*scratch*" "*scratchpad*" "*new-tab*" "*new-tab*x"
+                 "normal.txt" "foo.c" "archive.tar.gz" "script" "noext"
+                 ".hidden" "file." "a.b.c" ".x" "..x" "trailing~x")))
+    (dolist (name names)
+      (should
+       (equal (renerd-icons-dired--nerd-file-icon name)
+              (nerd-icons-icon-for-file
+               name :height renerd-icons-dired-icon-size))))))
+
+(ert-deftest renerd-icons-dired-incomplete-scan-not-covered ()
+  ;; If pending input aborts the visible scan, coverage must not claim the
+  ;; range: the rest has to be annotated later.
+  (renerd-test--dired (cl-loop for i below 100 collect (format "file-%03d.el" i))
+    (let ((renerd-icons-dired-file-icon-function (lambda (&rest _) "F"))
+          (renerd-icons-dired-dir-icon-function (lambda (&rest _) "D")))
+      (renerd-icons-dired-mode 1)
+      (renerd-icons-dired--remove-overlays t)
+      (setq renerd-icons-dired--coverage nil)
+      (cl-letf (((symbol-function 'input-pending-p) (lambda () t)))
+        (renerd-icons-dired--update-windows))
+      (should-not renerd-icons-dired--coverage)
+      ;; The incomplete scan left a rescheduled idle timer that finishes
+      ;; the remaining entries once input settles.
+      (should renerd-icons-dired--timer)
+      (renerd-test--drain)
+      (should renerd-icons-dired--coverage))))
+
 (ert-deftest renerd-icons-dired-symlink-uses-target-type ()
   (renerd-test--dired '("real-dir/" "a.el")
     (make-symbolic-link "real-dir"

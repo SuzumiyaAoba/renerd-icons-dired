@@ -60,10 +60,15 @@ The hot path is bounded by displayed lines, not directory size:
    Nerd Icons may check `.git`, symlink and remote status.  File icons are
    cached by the provided Dired file name and icon function.
 8. With the default `nerd-icons-icon-for-file`, names that cannot match
-   `nerd-icons-regexp-icon-alist` (checked via two combined regexps) resolve
-   through a per-extension cache instead of calling the icon function for
-   every name.  Set `renerd-icons-dired-fast-file-icons` to nil to always call
-   the configured function; results are identical either way.
+   `nerd-icons-regexp-icon-alist` resolve through a per-extension cache
+   instead of calling the icon function for every name.  The check itself is
+   table-driven: each alist regexp is classified once into required literal
+   prefixes (dispatched on the name's first character), required literal
+   suffixes (dispatched on the last character), or a small fallback regexp,
+   and basename/extension extraction avoids the `file-name-*` functions that
+   consult `file-name-handler-alist` on every call.  Set
+   `renerd-icons-dired-fast-file-icons` to nil to always call the configured
+   function; results are identical either way.
 
 Tradeoffs:
 

@@ -77,9 +77,10 @@
 When non-nil and `renerd-icons-dired-file-icon-function' is
 `nerd-icons-icon-for-file', file names that cannot match
 `nerd-icons-regexp-icon-alist' are resolved through a per-extension cache
-instead of calling the icon function for every file name.  Names matching
-the combined regexp still go through the real function, so results are
-identical to plain `nerd-icons-icon-for-file'."
+instead of calling the icon function for every file name.  Names that may
+match - decided by literal prefix/suffix dispatch tables built from the
+alist - still go through the real function, so results are identical to
+plain `nerd-icons-icon-for-file'."
   :type 'boolean
   :group 'renerd-icons-dired)
 
@@ -93,65 +94,274 @@ identical to plain `nerd-icons-icon-for-file'."
 (defvar renerd-icons-dired--file-cache (make-hash-table :test #'equal))
 (defvar renerd-icons-dired--dir-cache (make-hash-table :test #'equal))
 
-;; Fast path state for the default `nerd-icons-icon-for-file': two combined
-;; regexps deciding whether a name can be special (an anchored one tried only
-;; at position 0, and a cheaper unanchored one), plus a per-extension hash of
-;; the resulting icon string.
-(defvar renerd-icons-dired--special-anchored nil)
-(defvar renerd-icons-dired--special-unanchored nil)
+;; Fast path state for the default `nerd-icons-icon-for-file': dispatch
+;; tables deciding whether a name can be special, plus a per-extension hash
+;; of the resulting icon string.
+;;
+;; Every entry of `nerd-icons-regexp-icon-alist' is classified once:
+;;
+;; - `^'- or `\`'-anchored regexps contribute their required literal PREFIX,
+;;   bucketed by its first character in `renerd-icons-dired--prefix-table'.
+;; - Other `$'- or `\''-terminated regexps contribute their required literal
+;;   SUFFIX, bucketed by its last character in
+;;   `renerd-icons-dired--suffix-table'.
+;; - Anything that yields no usable prefix/suffix (empty literal run, a
+;;   top-level `\|', a non-string key, ...) goes into one of two fallback
+;;   regexps, `renerd-icons-dired--anchored-rest' and
+;;   `renerd-icons-dired--unanchored-rest', which are still far smaller than
+;;   the original alist.
+;;
+;; A file name can match the alist only if it starts with a prefix from its
+;; first-character bucket, ends with a suffix from its last-character
+;; bucket, or matches a fallback regexp.  Extraction is deliberately
+;; conservative: any construct that cannot be resolved shortens the literal
+;; run instead of guessing, so the gates can only produce false positives
+;; (a wasted delegation to `nerd-icons-icon-for-file'), never false
+;; negatives.
+(defvar renerd-icons-dired--prefix-table nil)
+(defvar renerd-icons-dired--anchored-rest nil)
+(defvar renerd-icons-dired--suffix-table nil)
+(defvar renerd-icons-dired--unanchored-rest nil)
 (defvar renerd-icons-dired--special-regexp-source :none)
 (defvar renerd-icons-dired--ext-cache nil)
 (defvar renerd-icons-dired--ext-cache-source nil)
+(defvar renerd-icons-dired--ext-alist-hash nil)
+(defvar renerd-icons-dired--ext-alist-hash-source nil)
+
+(defun renerd-icons-dired--escaped-literal-p (char)
+  "Return non-nil when the regexp escape \\CHAR denotes literal CHAR.
+Structural escapes (groups, alternation, assertions, syntax classes,
+back-references) use letters, digits, or a small set of punctuation, so
+any other escaped character is an ordinary literal."
+  (not (or (<= ?a char ?z)
+           (<= ?A char ?Z)
+           (<= ?0 char ?9)
+           (memq char '(?\( ?\) ?\{ ?\} ?\| ?= ?< ?> ?` ?' ?_)))))
+
+(defun renerd-icons-dired--literal-prefix (regexp)
+  "Return the longest string every match of REGEXP must begin with.
+Returns nil when no required literal prefix can be determined.  The scan
+stops at the first construct that may match something other than one
+fixed character; postfix operators retract the character they modify
+when it is optional.  The result is always a sound necessary prefix."
+  (let ((i 0) (len (length regexp)) chars done)
+    (while (and (< i len) (not done))
+      (let ((c (aref regexp i)))
+        (cond
+         ((eq c ?\\)
+          (if (or (>= (1+ i) len)
+                  (not (renerd-icons-dired--escaped-literal-p
+                        (aref regexp (1+ i)))))
+              (setq done t)
+            (push (aref regexp (1+ i)) chars)
+            (setq i (+ i 2))))
+         ((memq c '(?* ??))
+          ;; Optional or repeated: the modified char is not required.
+          (when chars (pop chars))
+          (setq done t))
+         ((eq c ?+)
+          ;; At least one occurrence required: keep the char, stop there.
+          (setq done t))
+         ;; `.', `[', `^', `$': variable or context-dependent constructs.
+         ;; `^'/`$' mid-pattern are literals in Emacs, but stopping is the
+         ;; conservative choice and barely weakens the gate.
+         ((memq c '(?. ?\[ ?^ ?$))
+          (setq done t))
+         (t (push c chars) (setq i (1+ i))))))
+    (and chars (apply #'string (nreverse chars)))))
+
+(defun renerd-icons-dired--end-anchor-pos (regexp)
+  "Return the index where REGEXP's end anchor begins, or nil.
+Only an unescaped trailing `$' or `\\'' anchors the pattern; an escaped
+final char (as in \"foo\\$\") is an ordinary literal, so the pattern is
+not end-anchored at all."
+  (let ((len (length regexp))
+        slashes j)
+    (cond
+     ((and (> len 0) (eq (aref regexp (1- len)) ?$))
+      (setq slashes 0 j (- len 2))
+      (while (and (>= j 0) (eq (aref regexp j) ?\\))
+        (setq slashes (1+ slashes) j (1- j)))
+      (and (evenp slashes) (1- len)))
+     ((and (> len 1)
+           (eq (aref regexp (- len 2)) ?\\)
+           (eq (aref regexp (1- len)) ?'))
+      (setq slashes 0 j (- len 3))
+      (while (and (>= j 0) (eq (aref regexp j) ?\\))
+        (setq slashes (1+ slashes) j (1- j)))
+      (and (evenp slashes) (- len 2))))))
+
+(defun renerd-icons-dired--literal-suffix (regexp end)
+  "Return the longest literal string every match of REGEXP must end with.
+END is the index of the end anchor, as returned by
+`renerd-icons-dired--end-anchor-pos'.  The scan walks backward from END
+collecting provably literal chars; any ambiguous construct - a
+metacharacter, a group or character-class boundary, a structural
+escape - ends the run instead of being parsed, so the result is always
+a sound necessary suffix or nil."
+  (let ((i (1- end)) chars)
+    (while (>= i 0)
+      (let* ((c (aref regexp i))
+             (slashes 0)
+             (j (1- i)))
+        (while (and (>= j 0) (eq (aref regexp j) ?\\))
+          (setq slashes (1+ slashes) j (1- j)))
+        (if (oddp slashes)
+            ;; `\C': literal only when C is an escaped literal char.
+            (if (renerd-icons-dired--escaped-literal-p c)
+                (progn (push c chars) (setq i (- i 2)))
+              (setq i -1))
+          ;; Bare char.  `.', `*', `+', `?', `[', `]', `^', `$' may be
+          ;; metacharacters and a bare `\\' cannot be classified without
+          ;; scanning forward, so all of them end the run.  Bare `(',
+          ;; `)', `{', `}', `|' are ordinary literals in Emacs regexps.
+          (if (memq c '(?. ?* ?+ ?? ?\[ ?\] ?^ ?$ ?\\))
+              (setq i -1)
+            (push c chars)
+            (setq i (1- i))))))
+    (and chars (apply #'string chars))))
+
+(defun renerd-icons-dired--top-level-alternation-p (regexp)
+  "Return non-nil when REGEXP contains `\\|' outside any group.
+Branches of a top-level alternation may disagree on anchoring, so the
+entry cannot be classified by a single prefix or suffix."
+  (let ((i 0) (len (length regexp)) (depth 0) found)
+    (while (and (< i len) (not found))
+      (if (eq (aref regexp i) ?\\)
+          (progn
+            (when (< (1+ i) len)
+              (let ((e (aref regexp (1+ i))))
+                (cond ((memq e '(?\( ?\{)) (setq depth (1+ depth)))
+                      ((memq e '(?\) ?\})) (setq depth (max 0 (1- depth))))
+                      ((and (eq e ?|) (zerop depth)) (setq found t)))))
+            (setq i (+ i 2)))
+        (setq i (1+ i))))
+    found))
 
 (defun renerd-icons-dired--special-regexps ()
-  "Refresh the combined regexps for special file names when needed.
-Sets `renerd-icons-dired--special-anchored' and
-`renerd-icons-dired--special-unanchored'.  A name can match
-`nerd-icons-regexp-icon-alist' only if it matches one of them; a nil regexp
-means no name can match that group (e.g. when a key is not a regexp string)."
+  "Refresh the special-name dispatch tables when the alist changed.
+Sets `renerd-icons-dired--prefix-table', `--anchored-rest',
+`--suffix-table' and `--unanchored-rest'.  See the comment block above the
+variables for the classification rules."
   (unless (eq renerd-icons-dired--special-regexp-source
               nerd-icons-regexp-icon-alist)
-    (let ((split (condition-case nil
-                     (let (anchored unanchored)
-                       (dolist (entry nerd-icons-regexp-icon-alist)
-                         (let ((regexp (car entry)))
-                           (cond
-                            ((string-prefix-p "^" regexp)
-                             (push (substring regexp 1) anchored))
-                            ((string-prefix-p "\\`" regexp)
-                             ;; `\` matches only at position 0 while `^'
-                             ;; also matches after newlines, so keeping it
-                             ;; in the anchored group is safe: the verdict
-                             ;; can only be a false positive, which merely
-                             ;; delegates to the real function.
-                             (push (substring regexp 2) anchored))
-                            (t (push regexp unanchored)))))
-                       (cons anchored unanchored))
-                   (error 'error))))
-      (setq renerd-icons-dired--special-anchored
-            (cond
-             ((eq split 'error)
-              ;; Unusable table: match every name so all lookups delegate
-              ;; to the real function.
-              "")
-             ((car split)
-              (concat "^\\(?:"
-                      (mapconcat #'identity (car split) "\\|")
-                      "\\)")))
-            renerd-icons-dired--special-unanchored
-            (and (consp split)
-                 (cdr split)
-                 (mapconcat (lambda (regexp)
-                              (concat "\\(?:" regexp "\\)"))
-                            (cdr split) "\\|"))
-            renerd-icons-dired--special-regexp-source
-            nerd-icons-regexp-icon-alist)
+    (let ((split
+           (condition-case nil
+               (let (prefix-alist anchored-any suffix-alist unanchored-any)
+                 (dolist (entry nerd-icons-regexp-icon-alist)
+                   (let ((regexp (car entry)))
+                     (cond
+                      ((not (stringp regexp))
+                       ;; Cannot poison a combined regexp; match everything.
+                       (push "" unanchored-any))
+                      ((renerd-icons-dired--top-level-alternation-p regexp)
+                       (push regexp unanchored-any))
+                      ((or (string-prefix-p "^" regexp)
+                           (string-prefix-p "\\`" regexp))
+                       ;; `\` matches only at position 0 while `^' also
+                       ;; matches after newlines; for the gate they are
+                       ;; interchangeable.
+                       (let* ((off (if (eq (aref regexp 0) ?^) 1 2))
+                              (body (substring regexp off))
+                              (prefix
+                               (renerd-icons-dired--literal-prefix body)))
+                         (if prefix
+                             (let ((cell (assq (aref prefix 0)
+                                               prefix-alist)))
+                               (if cell
+                                   (push prefix (cdr cell))
+                                 (push (cons (aref prefix 0) (list prefix))
+                                       prefix-alist)))
+                           (push body anchored-any))))
+                      ((renerd-icons-dired--end-anchor-pos regexp)
+                       ;; Only an end-anchored regexp can impose a
+                       ;; required suffix.  `end-anchor-pos' returns a
+                       ;; truthy index that `cond' already verified.
+                       (let ((suffix
+                              (renerd-icons-dired--literal-suffix
+                               regexp
+                               (renerd-icons-dired--end-anchor-pos
+                                regexp))))
+                         (if suffix
+                             (let ((c (aref suffix (1- (length suffix))))
+                                   (cell nil))
+                               (setq cell (assq c suffix-alist))
+                               (if cell
+                                   (push suffix (cdr cell))
+                                 (push (cons c (list suffix))
+                                       suffix-alist)))
+                           (push regexp unanchored-any))))
+                      ;; No usable anchor at either end: keep the regexp.
+                      (t (push regexp unanchored-any)))))
+                 (list prefix-alist anchored-any suffix-alist
+                       unanchored-any))
+             (error 'error))))
+      (if (eq split 'error)
+          ;; Unusable table: match every name so all lookups delegate to
+          ;; the real function.
+          (setq renerd-icons-dired--prefix-table nil
+                renerd-icons-dired--anchored-rest nil
+                renerd-icons-dired--suffix-table nil
+                renerd-icons-dired--unanchored-rest "")
+        (setq renerd-icons-dired--prefix-table
+              (let ((table (make-char-table nil)))
+                (dolist (cell (nth 0 split))
+                  (aset table (car cell) (cdr cell)))
+                table)
+              renerd-icons-dired--anchored-rest
+              (and (nth 1 split)
+                   (concat "^\\(?:"
+                           (mapconcat #'identity (nth 1 split) "\\|")
+                           "\\)"))
+              renerd-icons-dired--suffix-table
+              (let ((table (make-char-table nil)))
+                (dolist (cell (nth 2 split))
+                  (aset table (car cell) (cdr cell)))
+                table)
+              renerd-icons-dired--unanchored-rest
+              (and (nth 3 split)
+                   (mapconcat (lambda (regexp)
+                                (concat "\\(?:" regexp "\\)"))
+                              (nth 3 split) "\\|")))
+        (setq renerd-icons-dired--special-regexp-source
+              nerd-icons-regexp-icon-alist))
       ;; The extension table may have changed together with the regexp table.
       (unless (eq renerd-icons-dired--ext-cache-source
                   nerd-icons-extension-icon-alist)
         (setq renerd-icons-dired--ext-cache nil
               renerd-icons-dired--ext-cache-source
               nerd-icons-extension-icon-alist)))))
+
+(defun renerd-icons-dired--maybe-special-p (base)
+  "Return non-nil when BASE might match `nerd-icons-regexp-icon-alist'.
+This is a necessary-condition gate only: a positive answer always
+delegates to `nerd-icons-icon-for-file' for the real verdict, so false
+positives merely cost one extra call."
+  (let ((case-fold-search nil)
+        (len (length base)))
+    (or (and (> len 0)
+             renerd-icons-dired--prefix-table
+             (let (hit)
+               (dolist (prefix (aref renerd-icons-dired--prefix-table
+                                     (aref base 0))
+                               hit)
+                 (when (string-prefix-p prefix base)
+                   (setq hit t)))))
+        (and renerd-icons-dired--anchored-rest
+             (string-match-p renerd-icons-dired--anchored-rest base))
+        (and (> len 0)
+             renerd-icons-dired--suffix-table
+             (let (hit)
+               (dolist (suffix (aref renerd-icons-dired--suffix-table
+                                     (aref base (1- len)))
+                               hit)
+                 (when (string-suffix-p suffix base)
+                   (setq hit t)))))
+        (and renerd-icons-dired--unanchored-rest
+             (string-match-p renerd-icons-dired--unanchored-rest base))
+        ;; `^' also matches after a newline, which the prefix gate cannot
+        ;; see; names with an embedded newline always delegate.
+        (and (> len 0) (string-match-p "\n" base)))))
 
 (defun renerd-icons-dired--ext-cache ()
   "Return the per-extension icon cache for `nerd-icons-icon-for-file'."
@@ -163,35 +373,57 @@ means no name can match that group (e.g. when a key is not a regexp string)."
           nerd-icons-extension-icon-alist))
   renerd-icons-dired--ext-cache)
 
+(defun renerd-icons-dired--ext-alist ()
+  "Return `nerd-icons-extension-icon-alist' as a hash table.
+`assoc' would walk the 300+ entry alist linearly for every new
+extension; a hash keeps first lookups O(1).  Like `assoc', the first
+entry wins when the alist contains duplicate keys."
+  (unless (and renerd-icons-dired--ext-alist-hash
+               (eq renerd-icons-dired--ext-alist-hash-source
+                   nerd-icons-extension-icon-alist))
+    (let ((table (make-hash-table :test #'equal)))
+      (dolist (entry nerd-icons-extension-icon-alist)
+        (when (and (stringp (car entry)) (cdr entry))
+          (unless (gethash (car entry) table)
+            (puthash (car entry) entry table))))
+      (setq renerd-icons-dired--ext-alist-hash table
+            renerd-icons-dired--ext-alist-hash-source
+            nerd-icons-extension-icon-alist)))
+  renerd-icons-dired--ext-alist-hash)
+
 (defun renerd-icons-dired--nerd-file-icon (name)
   "Return the `nerd-icons-icon-for-file' icon string for NAME.
 This mirrors `nerd-icons-icon-for-file' with only the `:height' override:
 names that might match `nerd-icons-regexp-icon-alist' are delegated to the
 real function; the rest resolve through the per-extension cache."
-  (let ((base (file-name-nondirectory name)))
+  ;; `file-name-nondirectory'/`file-name-extension' consult
+  ;; `file-name-handler-alist' on every call; plain string searches give
+  ;; identical results for Dired names at a fraction of the cost.
+  (let* ((slash (string-match "/[^/]*\\'" name))
+         (base (if slash (substring name (1+ slash)) name)))
     (renerd-icons-dired--special-regexps)
-    (if (let ((case-fold-search nil))
-          (condition-case nil
-              (or (and renerd-icons-dired--special-anchored
-                       (string-match-p renerd-icons-dired--special-anchored
-                                       base))
-                  (and renerd-icons-dired--special-unanchored
-                       (string-match-p renerd-icons-dired--special-unanchored
-                                       base)))
-            ;; A malformed regexp would fail inside the real function too;
-            ;; delegate instead of guessing.
-            (error t)))
+    (if (condition-case nil
+            (renerd-icons-dired--maybe-special-p base)
+          ;; A malformed regexp would fail inside the real function too;
+          ;; delegate instead of guessing.
+          (error t))
         ;; Possibly special: exact behavior lives in the real function.
         (nerd-icons-icon-for-file name :height renerd-icons-dired-icon-size)
-      (let* ((ext (file-name-extension base))
-             (key (and ext (downcase ext)))
+      (let* ((dot (string-match "\\.[^.]*\\'" base))
+             ;; `file-name-extension' semantics: a trailing dot counts but
+             ;; a leading dot does not.
+             (ext (and dot (> dot 0) (substring base (1+ dot))))
              (cache (renerd-icons-dired--ext-cache))
-             (entry (and key (gethash key cache))))
+             ;; Lowercase extensions (the common case) hit without
+             ;; allocating a downcased key.
+             (entry (and ext (or (gethash ext cache)
+                                 (gethash (downcase ext) cache)))))
         (if (and entry (eql (car entry) renerd-icons-dired-icon-size))
             (cdr entry)
-          (let* ((icon (or (and key
-                                (cdr (assoc key
-                                            nerd-icons-extension-icon-alist)))
+          (let* ((key (and ext (downcase ext)))
+                 (icon (or (and key
+                                (cdr (gethash key
+                                              (renerd-icons-dired--ext-alist))))
                            nerd-icons-default-file-icon))
                  ;; (apply (car icon) (append (list (car args)) overrides
                  ;;                           (cdr args))), like the original.
@@ -222,23 +454,31 @@ or file-type rules."
   (interactive)
   (clrhash renerd-icons-dired--file-cache)
   (clrhash renerd-icons-dired--dir-cache)
-  (setq renerd-icons-dired--special-anchored nil
-        renerd-icons-dired--special-unanchored nil
+  (setq renerd-icons-dired--prefix-table nil
+        renerd-icons-dired--anchored-rest nil
+        renerd-icons-dired--suffix-table nil
+        renerd-icons-dired--unanchored-rest nil
         renerd-icons-dired--special-regexp-source :none
         renerd-icons-dired--ext-cache nil
-        renerd-icons-dired--ext-cache-source nil)
+        renerd-icons-dired--ext-cache-source nil
+        renerd-icons-dired--ext-alist-hash nil
+        renerd-icons-dired--ext-alist-hash-source nil)
   (dolist (buffer (buffer-list))
     (with-current-buffer buffer
       (when (bound-and-true-p renerd-icons-dired-mode)
         (renerd-icons-dired-refresh t)))))
 
 (defun renerd-icons-dired--icon (name directory-p special-p)
-  "Return the propertized prefix string for NAME.
+  "Return the ready-to-use `after-string' value for NAME.
+The string already carries the `display' spec that makes its own faces
+merge with faces active at the overlay position (e.g. `hl-line'), the
+same workaround nerd-icons-dired uses for rainstormstudio/nerd-icons-dired#1.
 DIRECTORY-P selects the directory icon function.  SPECIAL-P is non-nil for
 `.' and `..', whose visible prefix intentionally matches nerd-icons-dired."
   (if special-p
-      (propertize renerd-icons-dired-special-prefix-string
-                  'face 'renerd-icons-dired-overlay-face)
+      (let ((string (propertize renerd-icons-dired-special-prefix-string
+                                'face 'renerd-icons-dired-overlay-face)))
+        (propertize string 'display string))
     (let* ((function (if directory-p
                          renerd-icons-dired-dir-icon-function
                        renerd-icons-dired-file-icon-function))
@@ -272,13 +512,16 @@ DIRECTORY-P selects the directory icon function.  SPECIAL-P is non-nil for
                               (propertize
                                renerd-icons-dired-infix-string
                                'face 'renerd-icons-dired-overlay-face))))
-          (puthash key
-                   (cons (list function
-                               renerd-icons-dired-icon-size
-                               renerd-icons-dired-infix-string)
-                         string)
-                   table)
-          string)))))
+          ;; Cache the display-wrapped string: annotating an entry then
+          ;; needs no further string allocation.
+          (let ((wrapped (propertize string 'display string)))
+            (puthash key
+                     (cons (list function
+                                 renerd-icons-dired-icon-size
+                                 renerd-icons-dired-infix-string)
+                           wrapped)
+                     table)
+            wrapped))))))
 
 (defun renerd-icons-dired--dir-p (name)
   "Return non-nil when the entry on the current line is a directory.
@@ -311,11 +554,16 @@ names are resolved through `dired-get-filename' instead."
         (concat (or (dired-current-directory t) "") raw)))))
 
 (defun renerd-icons-dired--overlay-map (start end)
-  "Return a hash table mapping filename position to renerd overlay."
-  (let ((map (make-hash-table :test #'eql)))
-    (dolist (overlay (overlays-in start end))
-      (when (overlay-get overlay 'renerd-icons-dired-overlay)
-        (puthash (overlay-end overlay) overlay map)))
+  "Return a hash table mapping filename position to renerd overlay.
+Returns nil when START..END contains no overlays at all, which is the
+common case for fresh territory."
+  (let ((overlays (overlays-in start end))
+        map)
+    (when overlays
+      (setq map (make-hash-table :test #'eql))
+      (dolist (overlay overlays)
+        (when (overlay-get overlay 'renerd-icons-dired-overlay)
+          (puthash (overlay-end overlay) overlay map))))
     map))
 
 (defun renerd-icons-dired--annotate-at (pos name map generation)
@@ -327,16 +575,13 @@ Point must already be at POS."
                            (renerd-icons-dired--dir-p name)))
          (icon (renerd-icons-dired--icon name directory-p special))
          (beg (max (point-min) (1- pos)))
-         (overlay (gethash pos map)))
+         (overlay (and map (gethash pos map))))
     (if overlay
         (move-overlay overlay beg pos (current-buffer))
       (setq overlay (make-overlay beg pos (current-buffer) nil t)))
     (overlay-put overlay 'renerd-icons-dired-overlay t)
     (overlay-put overlay 'renerd-icons-dired-generation generation)
-    ;; A string-valued `display' spec makes the string's own faces merge with
-    ;; the faces active at POS (e.g. `hl-line'), the same workaround
-    ;; nerd-icons-dired uses for rainstormstudio/nerd-icons-dired#1.
-    (overlay-put overlay 'after-string (propertize icon 'display icon))
+    (overlay-put overlay 'after-string icon)
     overlay))
 
 (defun renerd-icons-dired--annotate-region (start end generation limit)
@@ -351,6 +596,11 @@ END without hitting LIMIT or pending input."
           (flat (null (cdr dired-subdir-alist)))
           (count 0)
           (pos start)
+          ;; Non-nil when POS is known to start a file name because it was
+          ;; reached through a nil->non-nil property transition; only the
+          ;; initial POS and positions after a mid-name skip need the
+          ;; explicit (1- pos) boundary check.
+          (at-start nil)
           seen)
       (while (and (< pos end)
                   (or (null limit) (< count limit))
@@ -359,14 +609,16 @@ END without hitting LIMIT or pending input."
         (if (not (get-text-property pos 'dired-filename))
             (setq pos (or (next-single-property-change
                            pos 'dired-filename nil end)
-                          end))
+                          end)
+                  at-start t)
           (setq seen t)
           (let ((fend (or (next-single-property-change pos 'dired-filename)
                           (point-max))))
-            (when (or (= pos (point-min))
+            (when (or at-start
+                      (= pos (point-min))
                       (not (get-text-property (1- pos) 'dired-filename)))
               ;; POS is the start of a file name.
-              (let ((overlay (gethash pos map)))
+              (let ((overlay (and map (gethash pos map))))
                 (unless (and overlay
                              (eql (overlay-get
                                    overlay 'renerd-icons-dired-generation)
@@ -376,7 +628,8 @@ END without hitting LIMIT or pending input."
                                      pos fend flat)))
                     (renerd-icons-dired--annotate-at pos name map generation)
                     (cl-incf count)))))
-            (setq pos fend))))
+            (setq pos fend
+                  at-start nil))))
       (if seen
           (cons count (>= pos end))
         ;; No `dired-filename' properties: nonstandard buffer, use the
@@ -396,7 +649,7 @@ See `renerd-icons-dired--annotate-region' for the return value."
                   (or (null limit) (< count limit))
                   (not (input-pending-p)))
         (when-let* ((pos (dired-move-to-filename nil)))
-          (let ((overlay (gethash pos map)))
+          (let ((overlay (and map (gethash pos map))))
             (unless (and overlay
                          (eql (overlay-get
                                overlay 'renerd-icons-dired-generation)
@@ -480,9 +733,14 @@ like `renerd-icons-dired--annotate-region'."
            (end (or (window-end window) (point-max))))
       (unless (renerd-icons-dired--covered-p generation tick start end)
         ;; Visible lines are cheap and should appear immediately.  Only the
-        ;; parts outside the covered range need work.
-        (renerd-icons-dired--annotate-uncovered start end generation tick nil)
-        (renerd-icons-dired--cover generation tick start end))
+        ;; parts outside the covered range need work.  Pending input can cut
+        ;; the scan short; coverage must only be claimed when it completed,
+        ;; otherwise the tail of the window would stay iconless for the
+        ;; whole epoch.
+        (if (cdr (renerd-icons-dired--annotate-uncovered
+                  start end generation tick nil))
+            (renerd-icons-dired--cover generation tick start end)
+          (renerd-icons-dired--schedule)))
       (pcase-let ((`(,pstart . ,pend)
                    (renerd-icons-dired--prefetch-bounds window)))
         (unless (renerd-icons-dired--covered-p generation tick pstart pend)
