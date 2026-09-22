@@ -114,6 +114,27 @@
         (renerd-test--drain)
         (should (> renerd-test--icon-calls first))))))
 
+(ert-deftest renerd-icons-dired-icon-face-preserved ()
+  (renerd-test--dired '("a.el")
+    ;; The icon function's `face' carries the icon color and font family;
+    ;; the overlay face must apply only to the padding we insert, and the
+    ;; `display' spec keeps those faces effective on the overlay string.
+    (let ((renerd-icons-dired-file-icon-function
+           (lambda (&rest _)
+             (propertize "I" 'face 'error 'font-lock-face 'error)))
+          (renerd-icons-dired-infix-string "|"))
+      (renerd-icons-dired-mode 1)
+      (renerd-test--drain)
+      (goto-char (point-min))
+      (dired-goto-file (expand-file-name "a.el" default-directory))
+      (let* ((overlay (car (overlays-in (1- (point)) (point))))
+             (string (overlay-get overlay 'after-string))
+             (shown (get-text-property 0 'display string)))
+        (should (equal (substring-no-properties shown) "I|"))
+        (should (eq (get-text-property 0 'face shown) 'error))
+        (should (eq (get-text-property 1 'face shown)
+                    'renerd-icons-dired-overlay-face))))))
+
 (ert-deftest renerd-icons-dired-teardown-removes-resources ()
   (renerd-test--dired '("a.el" "b.el")
     (renerd-icons-dired-mode 1)

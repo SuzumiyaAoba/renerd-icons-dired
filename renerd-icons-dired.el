@@ -260,15 +260,18 @@ DIRECTORY-P selects the directory icon function.  SPECIAL-P is non-nil for
                       (equal (caddr sig)
                              renerd-icons-dired-infix-string))))
           (cdr entry)
-        (let ((string (propertize
-                       (concat (if (and renerd-icons-dired-fast-file-icons
-                                        (not directory-p)
-                                        (eq function #'nerd-icons-icon-for-file))
-                                   (renerd-icons-dired--nerd-file-icon name)
-                                 (funcall function name
-                                          :height renerd-icons-dired-icon-size))
-                               renerd-icons-dired-infix-string)
-                       'face 'renerd-icons-dired-overlay-face)))
+        ;; Only the padding gets `renerd-icons-dired-overlay-face'; the icon
+        ;; string must keep the face set by the icon function, which carries
+        ;; both the color and the Nerd Font family the glyph needs.
+        (let ((string (concat (if (and renerd-icons-dired-fast-file-icons
+                                      (not directory-p)
+                                      (eq function #'nerd-icons-icon-for-file))
+                                  (renerd-icons-dired--nerd-file-icon name)
+                                (funcall function name
+                                         :height renerd-icons-dired-icon-size))
+                              (propertize
+                               renerd-icons-dired-infix-string
+                               'face 'renerd-icons-dired-overlay-face))))
           (puthash key
                    (cons (list function
                                renerd-icons-dired-icon-size
@@ -299,7 +302,7 @@ Dired-relative file name used for that fallback."
 FLAT means the buffer has a single subdirectory listing.  Quoted or escaped
 names are resolved through `dired-get-filename' instead."
   (let ((raw (buffer-substring-no-properties pos (min end (point-max)))))
-    (if (string-match-p "[\\\"]" raw)
+    (if (string-match-p "[\\\"']" raw)
         (save-excursion
           (goto-char pos)
           (dired-get-filename 'relative 'noerror))
@@ -330,7 +333,10 @@ Point must already be at POS."
       (setq overlay (make-overlay beg pos (current-buffer) nil t)))
     (overlay-put overlay 'renerd-icons-dired-overlay t)
     (overlay-put overlay 'renerd-icons-dired-generation generation)
-    (overlay-put overlay 'after-string icon)
+    ;; A string-valued `display' spec makes the string's own faces merge with
+    ;; the faces active at POS (e.g. `hl-line'), the same workaround
+    ;; nerd-icons-dired uses for rainstormstudio/nerd-icons-dired#1.
+    (overlay-put overlay 'after-string (propertize icon 'display icon))
     overlay))
 
 (defun renerd-icons-dired--annotate-region (start end generation limit)
